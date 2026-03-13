@@ -1,7 +1,7 @@
 import os
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
@@ -21,6 +21,8 @@ HEADERS = {
         "Chrome/145.0.0.0 Safari/537.36"
     )
 }
+
+CUTOFF_DATE_ET = datetime(2026, 3, 1, tzinfo=ZoneInfo("America/New_York"))
 
 TEAM_NAME_TO_ABBR = {
     "Arizona Diamondbacks": "ARI",
@@ -140,7 +142,6 @@ VALID_STATUSES = {
 
 DEFAULT_COLOR = 0x5865F2
 MAX_UPDATE_LEN = 220
-RECENT_DAYS = 1
 
 
 def clean_text(text: str) -> str:
@@ -183,9 +184,8 @@ def parse_comment_date(comment: str) -> datetime | None:
         return None
 
     month_day = match.group(1)
-    now_et = datetime.now(ZoneInfo("America/New_York"))
 
-    for year in (now_et.year, now_et.year - 1):
+    for year in (2026, 2025):
         try:
             dt = datetime.strptime(f"{month_day} {year}", "%b %d %Y")
             return dt.replace(tzinfo=ZoneInfo("America/New_York"))
@@ -195,14 +195,11 @@ def parse_comment_date(comment: str) -> datetime | None:
     return None
 
 
-def is_recent_update(comment: str, days: int = RECENT_DAYS) -> bool:
+def is_allowed_update(comment: str) -> bool:
     comment_dt = parse_comment_date(comment)
     if comment_dt is None:
         return False
-
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    cutoff = now_et - timedelta(days=days)
-    return comment_dt >= cutoff
+    return comment_dt >= CUTOFF_DATE_ET
 
 
 def parse_espn_injuries(html: str) -> list[dict]:
@@ -260,7 +257,7 @@ def parse_espn_injuries(html: str) -> list[dict]:
             position in VALID_POSITIONS
             and status in VALID_STATUSES
             and ":" in comment
-            and is_recent_update(comment)
+            and is_allowed_update(comment)
         ):
             items.append({
                 "team_name": current_team,
@@ -309,7 +306,7 @@ intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
 
-async def post_recent_updates() -> None:
+async def post_allowed_updates() -> None:
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
         print("[BOT] Channel not found.")
@@ -318,17 +315,22 @@ async def post_recent_updates() -> None:
     try:
         html = fetch_html()
         items = parse_espn_injuries(html)
-        print(f"[BOT] Parsed {len(items)} recent injury items")
+        print(f"[BOT] Parsed {len(items)} allowed injury items")
     except Exception as e:
         print(f"[BOT] Failed to fetch/parse ESPN page: {e}")
         return
 
     if not items:
-        print("[BOT] No recent items found.")
+        print("[BOT] No allowed items found.")
         return
 
-    # oldest to newest by comment date
-    items.sort(key=lambda x: parse_comment_date(x["comment"]) or datetime.min.replace(tzinfo=ZoneInfo("America/New_York")))
+    items.sort(
+        key=lambda x: (
+            parse_comment_date(x["comment"]) or CUTOFF_DATE_ET,
+            x["team"],
+            x["player"]
+        )
+    )
 
     for item in items:
         try:
@@ -347,7 +349,7 @@ async def background_loop() -> None:
     while not client.is_closed():
         if should_run_now():
             print("[BOT] Running injury check")
-            await post_recent_updates()
+            await post_allowed_updates()
         else:
             print("[BOT] Outside allowed hours. Skipping check.")
 
