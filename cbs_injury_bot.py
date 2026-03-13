@@ -1,7 +1,10 @@
 import os
 import asyncio
 import re
+import json
+import hashlib
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import discord
@@ -23,6 +26,9 @@ HEADERS = {
 }
 
 CUTOFF_DATE_ET = datetime(2026, 3, 1, tzinfo=ZoneInfo("America/New_York"))
+
+STATE_DIR = Path("state")
+STATE_FILE = STATE_DIR / "posted_injuries.json"
 
 TEAM_NAME_TO_ABBR = {
     "Arizona Diamondbacks": "ARI",
@@ -156,20 +162,50 @@ def clamp_update(text: str, max_len: int = MAX_UPDATE_LEN) -> str:
 
 
 def short_date(date_str: str) -> str:
-    for fmt in ("%b %d", "%b %d, %Y", "%B %d", "%B %d, %Y"):
+    now_year = datetime.now().year
+
+    for fmt in ("%b %d", "%B %d"):
         try:
-            dt = datetime.strptime(date_str, fmt)
-            if "%Y" not in fmt:
-                dt = dt.replace(year=datetime.now().year)
+            dt = datetime.strptime(f"{date_str} {now_year}", f"{fmt} %Y")
             return dt.strftime("%b %d")
         except ValueError:
             continue
+
     return date_str
 
 
 def should_run_now() -> bool:
     now_et = datetime.now(ZoneInfo("America/New_York"))
     return 7 <= now_et.hour < 24
+
+
+def load_state() -> dict:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not STATE_FILE.exists():
+        return {"posted_ids": []}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"posted_ids": []}
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+
+def make_update_id(item: dict) -> str:
+    raw = "|".join([
+        item["team"],
+        item["player"],
+        item["position"],
+        item["est_return"],
+        item["status"],
+        item["comment"],
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def fetch_html() -> str:
@@ -304,6 +340,7 @@ def build_embed(item: dict) -> discord.Embed:
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
+background_task_started = False
 
 
 async def post_allowed_updates() -> None:
@@ -311,6 +348,9 @@ async def post_allowed_updates() -> None:
     if channel is None:
         print("[BOT] Channel not found.")
         return
+
+    state = load_state()
+    posted_ids = set(state.get("posted_ids", []))
 
     try:
         html = fetch_html()
@@ -332,14 +372,27 @@ async def post_allowed_updates() -> None:
         )
     )
 
+    new_items = []
     for item in items:
+        update_id = make_update_id(item)
+        item["update_id"] = update_id
+        if update_id not in posted_ids:
+            new_items.append(item)
+
+    print(f"[BOT] New items: {len(new_items)}")
+
+    for item in new_items:
         try:
             embed = build_embed(item)
             await channel.send(embed=embed)
+            posted_ids.add(item["update_id"])
             print(f"[BOT] Posted: {item['player']} | {item['team']} | {item['status']}")
             await asyncio.sleep(1.0)
         except Exception as e:
             print(f"[BOT] Failed to post {item['player']}: {e}")
+
+    state["posted_ids"] = list(posted_ids)[-5000:]
+    save_state(state)
 
 
 async def background_loop() -> None:
@@ -358,8 +411,12 @@ async def background_loop() -> None:
 
 @client.event
 async def on_ready():
+    global background_task_started
     print(f"[BOT] Logged in as {client.user}")
-    asyncio.create_task(background_loop())
+
+    if not background_task_started:
+        background_task_started = True
+        asyncio.create_task(background_loop())
 
 
 async def main():
