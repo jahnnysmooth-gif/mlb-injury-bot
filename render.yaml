@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: mlb-injury-bot
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python cbs_injury_bot.py"
+    plan: starter
