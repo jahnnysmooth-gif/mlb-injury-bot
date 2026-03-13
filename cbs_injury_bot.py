@@ -351,11 +351,14 @@ async def post_allowed_updates() -> None:
 
     state = load_state()
     posted_ids = set(state.get("posted_ids", []))
+    print(f"[BOT] Loaded posted_ids: {len(posted_ids)}")
 
     try:
         html = fetch_html()
         items = parse_espn_injuries(html)
         print(f"[BOT] Parsed {len(items)} allowed injury items")
+        for item in items[:5]:
+            print("[BOT] Sample allowed item:", item)
     except Exception as e:
         print(f"[BOT] Failed to fetch/parse ESPN page: {e}")
         return
@@ -380,6 +383,8 @@ async def post_allowed_updates() -> None:
             new_items.append(item)
 
     print(f"[BOT] New items: {len(new_items)}")
+    for item in new_items[:5]:
+        print("[BOT] Will post:", item["player"], item["team"], item["status"])
 
     for item in new_items:
         try:
@@ -393,6 +398,7 @@ async def post_allowed_updates() -> None:
 
     state["posted_ids"] = list(posted_ids)[-5000:]
     save_state(state)
+    print(f"[BOT] Saved posted_ids: {len(state['posted_ids'])}")
 
 
 async def background_loop() -> None:
