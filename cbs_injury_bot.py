@@ -1,9 +1,7 @@
 import os
 import asyncio
-import hashlib
-import json
-from datetime import datetime
-from pathlib import Path
+import re
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
@@ -12,12 +10,9 @@ from bs4 import BeautifulSoup
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "900"))
 
 ESPN_URL = "https://www.espn.com/mlb/injuries"
-
-STATE_DIR = Path("state")
-STATE_FILE = STATE_DIR / "posted_injuries.json"
 
 HEADERS = {
     "User-Agent": (
@@ -145,6 +140,7 @@ VALID_STATUSES = {
 
 DEFAULT_COLOR = 0x5865F2
 MAX_UPDATE_LEN = 220
+RECENT_DAYS = 1
 
 
 def clean_text(text: str) -> str:
@@ -175,39 +171,38 @@ def should_run_now() -> bool:
     return 7 <= now_et.hour < 24
 
 
-def load_state() -> dict:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if not STATE_FILE.exists():
-        return {"posted_ids": []}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"posted_ids": []}
-
-
-def save_state(state: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-
-def make_update_id(item: dict) -> str:
-    raw = "|".join([
-        item["team"],
-        item["player"],
-        item["position"],
-        item["est_return"],
-        item["status"],
-        item["comment"],
-    ])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 def fetch_html() -> str:
     response = requests.get(ESPN_URL, headers=HEADERS, timeout=30)
     response.raise_for_status()
     return response.text
+
+
+def parse_comment_date(comment: str) -> datetime | None:
+    match = re.match(r"^([A-Z][a-z]{2}\s+\d{1,2}):", comment)
+    if not match:
+        return None
+
+    month_day = match.group(1)
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+
+    for year in (now_et.year, now_et.year - 1):
+        try:
+            dt = datetime.strptime(f"{month_day} {year}", "%b %d %Y")
+            return dt.replace(tzinfo=ZoneInfo("America/New_York"))
+        except ValueError:
+            continue
+
+    return None
+
+
+def is_recent_update(comment: str, days: int = RECENT_DAYS) -> bool:
+    comment_dt = parse_comment_date(comment)
+    if comment_dt is None:
+        return False
+
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    cutoff = now_et - timedelta(days=days)
+    return comment_dt >= cutoff
 
 
 def parse_espn_injuries(html: str) -> list[dict]:
@@ -265,6 +260,7 @@ def parse_espn_injuries(html: str) -> list[dict]:
             position in VALID_POSITIONS
             and status in VALID_STATUSES
             and ":" in comment
+            and is_recent_update(comment)
         ):
             items.append({
                 "team_name": current_team,
@@ -311,57 +307,37 @@ def build_embed(item: dict) -> discord.Embed:
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
-background_task_started = False
 
 
-async def post_new_updates() -> None:
+async def post_recent_updates() -> None:
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
         print("[BOT] Channel not found.")
         return
 
-    state = load_state()
-    posted_ids = set(state.get("posted_ids", []))
-
     try:
         html = fetch_html()
         items = parse_espn_injuries(html)
-        print(f"[BOT] Parsed {len(items)} injury items")
+        print(f"[BOT] Parsed {len(items)} recent injury items")
     except Exception as e:
         print(f"[BOT] Failed to fetch/parse ESPN page: {e}")
         return
 
-    current_ids = []
-    new_items = []
-
-    for item in items:
-        update_id = make_update_id(item)
-        item["update_id"] = update_id
-        current_ids.append(update_id)
-
-        if update_id not in posted_ids:
-            new_items.append(item)
-
-    if not posted_ids:
-        state["posted_ids"] = current_ids[-5000:]
-        save_state(state)
-        print(f"[BOT] First run detected. Seeded {len(current_ids)} items without posting.")
+    if not items:
+        print("[BOT] No recent items found.")
         return
 
-    print(f"[BOT] New items: {len(new_items)}")
+    # oldest to newest by comment date
+    items.sort(key=lambda x: parse_comment_date(x["comment"]) or datetime.min.replace(tzinfo=ZoneInfo("America/New_York")))
 
-    for item in new_items:
+    for item in items:
         try:
             embed = build_embed(item)
             await channel.send(embed=embed)
-            posted_ids.add(item["update_id"])
             print(f"[BOT] Posted: {item['player']} | {item['team']} | {item['status']}")
             await asyncio.sleep(1.0)
         except Exception as e:
             print(f"[BOT] Failed to post {item['player']}: {e}")
-
-    state["posted_ids"] = list(posted_ids)[-5000:]
-    save_state(state)
 
 
 async def background_loop() -> None:
@@ -371,7 +347,7 @@ async def background_loop() -> None:
     while not client.is_closed():
         if should_run_now():
             print("[BOT] Running injury check")
-            await post_new_updates()
+            await post_recent_updates()
         else:
             print("[BOT] Outside allowed hours. Skipping check.")
 
@@ -380,12 +356,8 @@ async def background_loop() -> None:
 
 @client.event
 async def on_ready():
-    global background_task_started
     print(f"[BOT] Logged in as {client.user}")
-
-    if not background_task_started:
-        background_task_started = True
-        asyncio.create_task(background_loop())
+    asyncio.create_task(background_loop())
 
 
 async def main():
