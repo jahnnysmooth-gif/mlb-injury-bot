@@ -1,14 +1,18 @@
+import os
 import asyncio
 import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 import requests
 from bs4 import BeautifulSoup
 
-from config import DISCORD_TOKEN, CHANNEL_ID, POLL_INTERVAL
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 
 ESPN_URL = "https://www.espn.com/mlb/injuries"
 
@@ -166,6 +170,11 @@ def short_date(date_str: str) -> str:
     return date_str
 
 
+def should_run_now() -> bool:
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    return 7 <= now_et.hour < 24
+
+
 def load_state() -> dict:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if not STATE_FILE.exists():
@@ -278,33 +287,20 @@ def build_embed(item: dict) -> discord.Embed:
     color = TEAM_COLORS.get(team, DEFAULT_COLOR)
     logo_url = TEAM_LOGOS.get(team)
 
-    embed = discord.Embed(
-        title="🚑 MLB INJURY UPDATE",
-        color=color
-    )
+    title = "🚑 MLB INJURY UPDATE"
+    if item["status"] == "60-Day-IL":
+        title = "🧊 60-DAY IL"
+    elif item["status"] == "Day-To-Day":
+        title = "⚠️ DAY-TO-DAY"
+    elif "IL" in item["status"]:
+        title = "🚨 IL PLACEMENT"
 
+    embed = discord.Embed(title=title, color=color)
     embed.description = f"**{item['player']}**\n`{team} • {item['position']}`"
-
-    embed.add_field(
-        name="Status",
-        value=f"`{item['status']}`",
-        inline=True
-    )
-    embed.add_field(
-        name="Est. Return",
-        value=f"`{short_date(item['est_return'])}`",
-        inline=True
-    )
-    embed.add_field(
-        name="Source",
-        value="`ESPN`",
-        inline=True
-    )
-    embed.add_field(
-        name="Update",
-        value=clamp_update(item["comment"]),
-        inline=False
-    )
+    embed.add_field(name="Status", value=f"`{item['status']}`", inline=True)
+    embed.add_field(name="Est. Return", value=f"`{short_date(item['est_return'])}`", inline=True)
+    embed.add_field(name="Source", value="`ESPN`", inline=True)
+    embed.add_field(name="Update", value=clamp_update(item["comment"]), inline=False)
 
     if logo_url:
         embed.set_thumbnail(url=logo_url)
@@ -331,8 +327,6 @@ async def post_new_updates() -> None:
         html = fetch_html()
         items = parse_espn_injuries(html)
         print(f"[BOT] Parsed {len(items)} injury items")
-        for item in items[:5]:
-            print("[BOT] Sample:", item)
     except Exception as e:
         print(f"[BOT] Failed to fetch/parse ESPN page: {e}")
         return
@@ -371,8 +365,16 @@ async def post_new_updates() -> None:
 
 
 async def background_loop() -> None:
+    await client.wait_until_ready()
+    print("[BOT] ESPN injury bot started")
+
     while not client.is_closed():
-        await post_new_updates()
+        if should_run_now():
+            print("[BOT] Running injury check")
+            await post_new_updates()
+        else:
+            print("[BOT] Outside allowed hours. Skipping check.")
+
         await asyncio.sleep(POLL_INTERVAL)
 
 
@@ -383,11 +385,14 @@ async def on_ready():
 
     if not background_task_started:
         background_task_started = True
-        print("[BOT] ESPN injury bot started")
         asyncio.create_task(background_loop())
 
 
 async def main():
+    if not DISCORD_TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is not set")
+    if not CHANNEL_ID:
+        raise RuntimeError("CHANNEL_ID is not set")
     await client.start(DISCORD_TOKEN)
 
 
